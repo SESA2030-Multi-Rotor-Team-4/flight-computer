@@ -6,3 +6,7 @@
 .test
 .lib
 .include
+lib/README
+test/README
+include/README
+.vscode/extensions.json
