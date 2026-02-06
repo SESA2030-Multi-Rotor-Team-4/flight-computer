@@ -19,9 +19,9 @@ float temp;
 const int g = 9.81;
 
 // Servo centre positions
-const int PITCH_CENTRE = 90;
-const int ROLL_CENTRE = 90;
-const int YAW_CENTRE = 90;
+const float PITCH_CENTRE = 75.0;
+const float ROLL_CENTRE = 90.0;
+const float YAW_CENTRE = 90.0;
 
 // Sensitivity (increase for more response, decrease for less)
 const float PITCH_GAIN = 1.0;
@@ -29,7 +29,7 @@ const float ROLL_GAIN = 1.0;
 const float YAW_GAIN = 1.0;
 
 // Smoothing (0.0 - 1.0, higher = smoother but slower response)
-const float SMOOTHING = 0;
+const float SMOOTHING = 0.5;
 
 float smoothPitch = 0;
 float smoothRoll = 0;
@@ -86,9 +86,9 @@ void loop()
   smoothYaw = smoothYaw * (1- SMOOTHING) + angz * SMOOTHING;
 
   // Calculating servo positions
-  int pitchPos = constrain(PITCH_CENTRE - (smoothPitch * PITCH_GAIN), 0, 180);
-  int rollPos = constrain(ROLL_CENTRE - (smoothRoll * ROLL_GAIN), 0, 180);
-  int yawPos = constrain(YAW_CENTRE - (smoothYaw * YAW_GAIN), 0, 180);
+  float pitchPos = constrain(PITCH_CENTRE - (smoothPitch * PITCH_GAIN), 0, 180);
+  float rollPos = constrain(ROLL_CENTRE - (smoothRoll * ROLL_GAIN), 0, 180);
+  float yawPos = constrain(YAW_CENTRE - (smoothYaw * YAW_GAIN), 0, 180);
 
   // Writing to servos
   servo_pitch.write(pitchPos);
@@ -98,12 +98,15 @@ void loop()
   // ## Teleplot output ##
 
   // MPU raw reads
-  Serial.print(">Pitch:");
+  /*
+    Serial.print(">Pitch:");
   Serial.println(angx);
   Serial.print(">Roll:");
   Serial.println(angy);
   Serial.print(">Yaw:");
   Serial.println(angz);
+  */
+
   // Servo writes
   Serial.print(">ServoPitch:");
   Serial.println(pitchPos);
@@ -111,6 +114,13 @@ void loop()
   Serial.println(rollPos);
   Serial.print(">ServoYaw:");
   Serial.println(yawPos);
+  // Servo writes
+  Serial.print(">SmoothPitch:");
+  Serial.println(smoothPitch);
+  Serial.print(">SmoothRoll:");
+  Serial.println(smoothRoll);
+  Serial.print(">SmoothYaw:");
+  Serial.println(smoothYaw);
 
   /*
   Serial.print(">AccX:"); // Extra spaces to clear any leftover characters
