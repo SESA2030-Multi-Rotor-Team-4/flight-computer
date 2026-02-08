@@ -16,20 +16,25 @@ float ax, ay, az;
 float gx, gy, gz;
 float angx, angy, angz;
 float temp;
-const int g = 9.81;
+const float g = 9.81;
+const float MAX_STEP = 2.0; // Max degrees per loop iteration
 
 // Servo centre positions
-const float PITCH_CENTRE = 75.0;
+const float PITCH_CENTRE = 90.0;
 const float ROLL_CENTRE = 90.0;
 const float YAW_CENTRE = 90.0;
 
-// Sensitivity (increase for more response, decrease for less)
-const float PITCH_GAIN = 1.0;
-const float ROLL_GAIN = 1.0;
-const float YAW_GAIN = 1.0;
+float lastPitchPos = PITCH_CENTRE;
+float lastRollPos = ROLL_CENTRE;
+float lastYawPos = YAW_CENTRE;
 
-// Smoothing (0.0 - 1.0, higher = smoother but slower response)
-const float SMOOTHING = 0.5;
+// Sensitivity (increase for more response, decrease for less)
+const float PITCH_GAIN = 3.0;
+const float ROLL_GAIN = 2.0;
+const float YAW_GAIN = 4.0;
+
+// Smoothing (0.0 - 1.0)
+const float SMOOTHING = 0.15;
 
 float smoothPitch = 0;
 float smoothRoll = 0;
@@ -45,6 +50,14 @@ int valaz;
 Servo servo_pitch;
 Servo servo_roll;
 Servo servo_yaw;
+
+void sweepServo(Servo &s) {
+  int positions[] = {0, 90, 180, 90};
+  for (int pos : positions) {
+    s.write(pos);
+    delay(1000);
+  }
+}
 
 void setup()
 {
@@ -64,6 +77,7 @@ void setup()
   servo_pitch.write(PITCH_CENTRE);
   servo_roll.write(ROLL_CENTRE);
   servo_yaw.write(YAW_CENTRE);
+
   delay(500);
 }
 
@@ -90,37 +104,48 @@ void loop()
   float rollPos = constrain(ROLL_CENTRE - (smoothRoll * ROLL_GAIN), 0, 180);
   float yawPos = constrain(YAW_CENTRE - (smoothYaw * YAW_GAIN), 0, 180);
 
+  pitchPos = lastPitchPos + constrain(pitchPos - lastPitchPos, -MAX_STEP, MAX_STEP);
+  rollPos = lastRollPos + constrain(rollPos - lastRollPos, -MAX_STEP, MAX_STEP);
+  yawPos = lastYawPos + constrain(yawPos - lastYawPos, -MAX_STEP, MAX_STEP);
+
+  lastPitchPos = pitchPos;
+  lastRollPos = rollPos;
+  lastYawPos = yawPos;
+
   // Writing to servos
   servo_pitch.write(pitchPos);
   servo_roll.write(rollPos);
   servo_yaw.write(yawPos);
 
+
   // ## Teleplot output ##
 
   // MPU raw reads
-  /*
-    Serial.print(">Pitch:");
+  
+  Serial.print(">Pitch:");
   Serial.println(angx);
   Serial.print(">Roll:");
   Serial.println(angy);
   Serial.print(">Yaw:");
   Serial.println(angz);
-  */
+  
 
   // Servo writes
-  Serial.print(">ServoPitch:");
+  Serial.print(">ServoPitch(9):");
   Serial.println(pitchPos);
-  Serial.print(">ServoRoll:");
+  Serial.print(">ServoRoll(10):");
   Serial.println(rollPos);
-  Serial.print(">ServoYaw:");
+  Serial.print(">ServoYaw(11):");
   Serial.println(yawPos);
   // Servo writes
+  /*
   Serial.print(">SmoothPitch:");
   Serial.println(smoothPitch);
   Serial.print(">SmoothRoll:");
   Serial.println(smoothRoll);
   Serial.print(">SmoothYaw:");
   Serial.println(smoothYaw);
+  */
 
   /*
   Serial.print(">AccX:"); // Extra spaces to clear any leftover characters
