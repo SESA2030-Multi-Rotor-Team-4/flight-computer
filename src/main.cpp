@@ -2,91 +2,226 @@
 #include <Wire.h>
 #include <SPI.h>
 #include <SdFat.h>
-#include <SoftwareSerial.h>
 #include <MPU6050_light.h>
 #include <Servo.h>
 
 /*
-MPU Wiring
-VCC = 3.3v
-int = 2
-scl = a5
-sda = a4
-
-MSP Data Reader (Serial Monitor Version)
-WIRING:
-  - FC TX  ---> Arduino Pin 2 (Soft RX)
-  - FC RX  <--- Arduino Pin 3 (Soft TX) [Use Voltage Divider!]
-  - FC GND <--- Arduino GND
+This sketch is split into small modules for sensing, filtering, servo control, 
+mode handling, and logging.
 */
 
-// ======== PIN ASSIGNMENT ========
-// Create a virtual serial port on Pins 2 and 3
-// RX = Pin 2, TX = Pin 3
-SoftwareSerial droneSerial(2, 3);
-// Ultrasound Sensor pins
-constexpr uint8_t TRIG_PIN = 6;
-constexpr uint8_t ECHO_PIN = 7;
+// Pin assignments for the hardware connections.
 // SD Card pin
 constexpr uint8_t SD_CS = 4;
+// Mode control pin from RC/receiver PWM input
+constexpr uint8_t MODE_PIN = 2;
 // Servo pins
-constexpr uint8_t PITCH_PIN = 9;
+constexpr uint8_t PITCH_PIN = 6;
 constexpr uint8_t ROLL_PIN = 10;
-constexpr uint8_t YAW_PIN = 11;
+constexpr uint8_t YAW_PIN = 9;
 
-// ======== MSP ========
-// MSP Request for Attitude (Command 108)
-static const byte MSP_REQ_ATTITUDE[] PROGMEM = {0x24, 0x4D, 0x3C, 0x00, 0x6C, 0x6C};
-constexpr uint8_t MSP_REQ_LEN = 6;
-constexpr uint8_t MSP_REPLY_LEN = 12;
-constexpr uint32_t MSP_PERIOD_MS = 100;
-
-int16_t mspRoll, mspPitch, mspYaw;
-uint32_t lastMspMs = 0;
-
-// ======== MPU ========
+// IMU state and raw sensor values.
 MPU6050 mpu(Wire);
 constexpr float G_MPS2 = 9.81f; // gravity if we need it
+
+float rawAx, rawAy, rawAz;
+float rawGx, rawGy, rawGz;
+float rawAngx, rawAngy, rawAngz;
 
 float ax, ay, az;
 float gx, gy, gz;
 float angx, angy, angz;
 
-// ======== Servo Constants ========
-constexpr float PITCH_CENTRE = 90.0f;
-constexpr float ROLL_CENTRE = 90.0f;
-constexpr float YAW_CENTRE = 90.0f;
+// Filter settings and shared low-pass filters for each sensor axis.
+constexpr float MPU_FILTER_Q = 0.7071f;
+constexpr float ANGLE_FILTER_CUTOFF_HZ = 12.0f;
+constexpr float GYRO_FILTER_CUTOFF_HZ = 18.0f;
+constexpr float ACCEL_FILTER_CUTOFF_HZ = 15.0f;
+
+constexpr uint32_t MODE_PULSE_TIMEOUT_US = 25000UL;
+constexpr uint16_t MODE_STABILISING_THRESHOLD_US = 1500;
+
+enum class GimbalMode : uint8_t
+{
+  Locked,
+  Stabilising
+};
+
+// Simple biquad low-pass filter used by the sensor processing module.
+struct BiquadLowPass
+{
+  float b0 = 0.0f;
+  float b1 = 0.0f;
+  float b2 = 0.0f;
+  float a1 = 0.0f;
+  float a2 = 0.0f;
+  float x1 = 0.0f;
+  float x2 = 0.0f;
+  float y1 = 0.0f;
+  float y2 = 0.0f;
+  float cutoffHz = 0.0f;
+  float q = MPU_FILTER_Q;
+  float sampleRateHz = 200.0f;
+  bool configured = false;
+
+  void configure(float newCutoffHz, float newSampleRateHz, float newQ)
+  {
+    if (newCutoffHz <= 0.0f || newSampleRateHz <= 0.0f || newQ <= 0.0f)
+      return;
+
+    cutoffHz = newCutoffHz;
+    sampleRateHz = newSampleRateHz;
+    q = newQ;
+
+    const float w0 = 2.0f * PI * cutoffHz / sampleRateHz;
+    const float cosW0 = cosf(w0);
+    const float sinW0 = sinf(w0);
+    const float alpha = sinW0 / (2.0f * q);
+    const float a0 = 1.0f + alpha;
+
+    b0 = ((1.0f - cosW0) * 0.5f) / a0;
+    b1 = (1.0f - cosW0) / a0;
+    b2 = ((1.0f - cosW0) * 0.5f) / a0;
+    a1 = (-2.0f * cosW0) / a0;
+    a2 = (1.0f - alpha) / a0;
+    configured = true;
+  }
+
+  void reset(float value)
+  {
+    x1 = value;
+    x2 = value;
+    y1 = value;
+    y2 = value;
+  }
+
+  float update(float input, float dtSeconds)
+  {
+    if (dtSeconds <= 0.0f)
+      return input;
+
+    const float currentFs = 1.0f / dtSeconds;
+    if (!configured || fabsf(currentFs - sampleRateHz) > sampleRateHz * 0.05f)
+      configure(cutoffHz > 0.0f ? cutoffHz : 1.0f, currentFs, q > 0.0f ? q : MPU_FILTER_Q);
+
+    const float output = b0 * input + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+    x2 = x1;
+    x1 = input;
+    y2 = y1;
+    y1 = output;
+    return output;
+  }
+};
+
+BiquadLowPass angleXFilter;
+BiquadLowPass angleYFilter;
+BiquadLowPass angleZFilter;
+BiquadLowPass accelXFilter;
+BiquadLowPass accelYFilter;
+BiquadLowPass accelZFilter;
+BiquadLowPass gyroXFilter;
+BiquadLowPass gyroYFilter;
+BiquadLowPass gyroZFilter;
+
+// Servo center positions and rate limits.
+constexpr float PITCH_CENTRE = 20.0f;
+constexpr float ROLL_CENTRE = 45.0f;
+constexpr float YAW_CENTRE = 40.0f;
 constexpr float MAX_STEP = 180.0f;
 
-// ======== PID & Filter Gains ========
-// Sensitivity (increase for more response, decrease for less) (P term in PID)
-constexpr float PITCH_GAIN = 2.0f;
-constexpr float ROLL_GAIN = 2.5f;
-constexpr float YAW_GAIN = 1.0f;
-// Damping gain — higher = more overshoot suppression (D term in PID)
-constexpr float PITCH_DAMP = 0.0f;
-constexpr float ROLL_DAMP = 0.0f;
-constexpr float YAW_DAMP = 0.0f;
-// Smoothing (0.0 - 1.0)
-constexpr float SMOOTHING = 0.3f;
-constexpr float GYRO_SMOOTHING = 0.15f;
-// Deadband - ignore angle changes smaller than this (degrees)
-constexpr float DEADBAND = 1.5f;
-constexpr float GYRO_DEADBAND = 0.5f;
+// Servo angle limits to keep the gimbal inside a safe range.
+constexpr float PITCH_MIN = 0.0f;      // prevent forward tilt beyond this
+constexpr float PITCH_MAX = 120.0f;     // prevent backward tilt beyond this
+constexpr float ROLL_MIN = 0.0f;      // prevent left roll beyond this
+constexpr float ROLL_MAX = 180.0f;     // prevent right roll beyond this
+constexpr float YAW_MIN = 0.0f;        // prevent left yaw beyond this
+constexpr float YAW_MAX = 180.0f;      // prevent right yaw beyond this
 
-// ======== Servo State ========
+// Control gains for the stabilization response.
+constexpr float PITCH_GAIN = 2.0f;
+constexpr float ROLL_GAIN = 2.0f;
+constexpr float YAW_GAIN = 1.2f;
+// Damping from gyro rate feedback.
+constexpr float PITCH_DAMP = 0.05f;
+constexpr float ROLL_DAMP = 0.05f;
+constexpr float YAW_DAMP = 0.05f;
+// Deadbands to ignore small noise around zero.
+constexpr float DEADBAND = 1.0f;
+constexpr float GYRO_DEADBAND = 10.0f;
+
+// Servo objects and current output positions.
 Servo servo_pitch, servo_roll, servo_yaw;
 float lastPitchPos, lastRollPos, lastYawPos;
-float smoothPitch = 0, smoothRoll = 0, smoothYaw = 0;
-float smoothGx = 0, smoothGy = 0, smoothGz = 0;
+float lockedPitchPos = PITCH_CENTRE;
+float lockedRollPos = ROLL_CENTRE;
+float lockedYawPos = YAW_CENTRE;
 
-// ======== MPU Settling ========
+// Startup settling state for the IMU and filters.
 bool mpuSettled = false;
 constexpr float SETTLE_THRESHOLD = 1.0f;
 constexpr uint8_t SETTLE_COUNT = 50; // Wraps above 255, do not increase above 255
 uint8_t stableReadings = 0;
+bool filtersJustReset = false;
+uint32_t lastFilterUpdateUs = 0;
+GimbalMode gimbalMode = GimbalMode::Stabilising;
+GimbalMode lastGimbalMode = GimbalMode::Stabilising;
+uint32_t lastModeReadMs = 0;
 
-// ======== SD Card ========
+// Read the current gimbal mode from the PWM control input.
+GimbalMode readGimbalMode()
+{
+  const uint32_t nowMs = millis();
+  if (nowMs - lastModeReadMs < 20)
+    return gimbalMode;
+
+  lastModeReadMs = nowMs;
+  const unsigned long pulseWidthUs = pulseIn(MODE_PIN, HIGH, MODE_PULSE_TIMEOUT_US);
+  if (pulseWidthUs == 0)
+    return GimbalMode::Stabilising;
+
+  return (pulseWidthUs >= MODE_STABILISING_THRESHOLD_US) ? GimbalMode::Stabilising : GimbalMode::Locked;
+}
+
+// Update mode state and reset filters when re-entering stabilisation.
+void handleModeTransition(GimbalMode newMode)
+{
+  if (newMode == gimbalMode)
+    return;
+
+  lastGimbalMode = gimbalMode;
+  gimbalMode = newMode;
+
+  if (gimbalMode == GimbalMode::Stabilising)
+  {
+    angleXFilter.reset(rawAngx);
+    angleYFilter.reset(rawAngy);
+    angleZFilter.reset(rawAngz);
+    accelXFilter.reset(rawAx);
+    accelYFilter.reset(rawAy);
+    accelZFilter.reset(rawAz);
+    gyroXFilter.reset(rawGx);
+    gyroYFilter.reset(rawGy);
+    gyroZFilter.reset(rawGz);
+
+    angx = rawAngx;
+    angy = rawAngy;
+    angz = rawAngz;
+    ax = rawAx;
+    ay = rawAy;
+    az = rawAz;
+    gx = rawGx;
+    gy = rawGy;
+    gz = rawGz;
+
+    lastFilterUpdateUs = micros();
+    filtersJustReset = true;
+  }
+
+  Serial.print(F("Gimbal mode: "));
+  Serial.println(gimbalMode == GimbalMode::Stabilising ? F("stabilising") : F("locked"));
+}
+
+// SD logging state and timing.
 SdFat sd;
 SdFile logFile;
 constexpr uint16_t LOG_HZ = 50;
@@ -96,25 +231,46 @@ uint32_t lastLogMs = 0;
 uint32_t lastFlushMs = 0;
 bool sdReady = false;
 
+// Wait for the IMU to settle before enabling normal control.
 bool mpuSettling()
 {
   if (mpuSettled)
     return false;
 
-  if (fabsf(angx) < SETTLE_THRESHOLD &&
-      fabsf(angy) < SETTLE_THRESHOLD &&
-      fabsf(angz) < SETTLE_THRESHOLD)
+  if (fabsf(rawAngx) < SETTLE_THRESHOLD &&
+      fabsf(rawAngy) < SETTLE_THRESHOLD &&
+      fabsf(rawAngz) < SETTLE_THRESHOLD)
   {
     if (++stableReadings >= SETTLE_COUNT)
     {
       mpuSettled = true;
       mpu.calcOffsets();
-      smoothPitch = angx;
-      smoothRoll = angy;
-      smoothYaw = angz;
-      lastPitchPos = constrain(PITCH_CENTRE - angx * PITCH_GAIN, 0.0f, 180.0f);
-      lastRollPos = constrain(ROLL_CENTRE - angy * ROLL_GAIN, 0.0f, 180.0f);
-      lastYawPos = constrain(YAW_CENTRE - angz * YAW_GAIN, 0.0f, 180.0f);
+
+      angleXFilter.reset(rawAngx);
+      angleYFilter.reset(rawAngy);
+      angleZFilter.reset(rawAngz);
+      accelXFilter.reset(rawAx);
+      accelYFilter.reset(rawAy);
+      accelZFilter.reset(rawAz);
+      gyroXFilter.reset(rawGx);
+      gyroYFilter.reset(rawGy);
+      gyroZFilter.reset(rawGz);
+
+      angx = rawAngx;
+      angy = rawAngy;
+      angz = rawAngz;
+      ax = rawAx;
+      ay = rawAy;
+      az = rawAz;
+      gx = rawGx;
+      gy = rawGy;
+      gz = rawGz;
+
+      lastPitchPos = constrain(PITCH_CENTRE - angx * PITCH_GAIN, PITCH_MIN, PITCH_MAX);
+      lastRollPos = constrain(ROLL_CENTRE - angy * ROLL_GAIN, ROLL_MIN, ROLL_MAX);
+      lastYawPos = constrain(YAW_CENTRE - angz * YAW_GAIN, YAW_MIN, YAW_MAX);
+      filtersJustReset = true;
+      lastFilterUpdateUs = micros();
       Serial.println(F("MPU settled"));
       return false;
     }
@@ -126,249 +282,82 @@ bool mpuSettling()
   return true;
 }
 
-// ——————————————————————————————————————————
-// Helper: apply deadband
-// ——————————————————————————————————————————
+// Update filtered sensor outputs using the current time step.
+void updateMpuFilters(uint32_t nowUs)
+{
+  if (lastFilterUpdateUs == 0)
+  {
+    lastFilterUpdateUs = nowUs;
+    return;
+  }
+
+  const float dtSeconds = (nowUs - lastFilterUpdateUs) * 1.0e-6f;
+  lastFilterUpdateUs = nowUs;
+
+  angx = angleXFilter.update(rawAngx, dtSeconds);
+  angy = angleYFilter.update(rawAngy, dtSeconds);
+  angz = angleZFilter.update(rawAngz, dtSeconds);
+  ax = accelXFilter.update(rawAx, dtSeconds);
+  ay = accelYFilter.update(rawAy, dtSeconds);
+  az = accelZFilter.update(rawAz, dtSeconds);
+  gx = gyroXFilter.update(rawGx, dtSeconds);
+  gy = gyroYFilter.update(rawGy, dtSeconds);
+  gz = gyroZFilter.update(rawGz, dtSeconds);
+}
+
+// Return zero for small values so noise does not drive the servos.
 static inline float deadband(float v, float db)
 {
   return (fabsf(v) < db) ? 0.0f : v;
 }
 
-// ——————————————————————————————————————————
-// Filter + servo position calculation
-// ——————————————————————————————————————————
+// Convert filtered IMU data into stabilizing servo commands.
 void filterAndActuate()
 {
-  // EMA smoothing
-  smoothPitch += SMOOTHING * (angx - smoothPitch);
-  smoothRoll += SMOOTHING * (angy - smoothRoll);
-  smoothYaw += SMOOTHING * (angz - smoothYaw);
-  smoothGx += GYRO_SMOOTHING * (gx - smoothGx);
-  smoothGy += GYRO_SMOOTHING * (gy - smoothGy);
-  smoothGz += GYRO_SMOOTHING * (gz - smoothGz);
+  const float ep = deadband(angx, DEADBAND);
+  const float er = deadband(angy, DEADBAND);
+  const float ey = deadband(angz, DEADBAND);
+  const float dg = deadband(gx, GYRO_DEADBAND);
+  const float dr = deadband(gy, GYRO_DEADBAND);
+  const float dy = deadband(gz, GYRO_DEADBAND);
 
-  const float ep = deadband(smoothPitch, DEADBAND);
-  const float er = deadband(smoothRoll, DEADBAND);
-  const float ey = deadband(smoothYaw, DEADBAND);
-  const float dg = deadband(smoothGx, GYRO_DEADBAND);
-  const float dr = deadband(smoothGy, GYRO_DEADBAND);
-  const float dy = deadband(smoothGz, GYRO_DEADBAND);
-
-  float pPos = constrain(PITCH_CENTRE - ep * PITCH_GAIN - dg * PITCH_DAMP, 0.0f, 180.0f);
-  float rPos = constrain(ROLL_CENTRE - er * ROLL_GAIN - dr * ROLL_DAMP, 0.0f, 180.0f);
-  float yPos = constrain(YAW_CENTRE - ey * YAW_GAIN - dy * YAW_DAMP, 0.0f, 180.0f);
+  float pPos = constrain(PITCH_CENTRE - ep * PITCH_GAIN - dg * PITCH_DAMP, PITCH_MIN, PITCH_MAX);
+  float rPos = constrain(ROLL_CENTRE - er * ROLL_GAIN - dr * ROLL_DAMP, ROLL_MIN, ROLL_MAX);
+  float yPos = constrain(YAW_CENTRE - ey * YAW_GAIN - dy * YAW_DAMP, YAW_MIN, YAW_MAX);
 
   // Rate-limit
   lastPitchPos += constrain(pPos - lastPitchPos, -MAX_STEP, MAX_STEP);
   lastRollPos += constrain(rPos - lastRollPos, -MAX_STEP, MAX_STEP);
   lastYawPos += constrain(yPos - lastYawPos, -MAX_STEP, MAX_STEP);
 
-  servo_pitch.write((int)lastPitchPos);
-  servo_roll.write((int)lastRollPos);
   servo_yaw.write((int)lastYawPos);
+  servo_roll.write((int)lastRollPos);
+  servo_pitch.write((int)lastPitchPos);
 }
 
-// ======== Ultrasonic State Machine ========
-enum UltraState : uint8_t
+// Hold the servos at the stored locked position.
+void holdLockedPosition()
 {
-  US_IDLE,
-  US_TRIGGER,
-  US_WAIT_ECHO
-};
+  lastPitchPos += constrain(lockedPitchPos - lastPitchPos, -MAX_STEP, MAX_STEP);
+  lastRollPos += constrain(lockedRollPos - lastRollPos, -MAX_STEP, MAX_STEP);
+  lastYawPos += constrain(lockedYawPos - lastYawPos, -MAX_STEP, MAX_STEP);
 
-UltraState usState = US_IDLE;
-uint32_t usTriggerUs = 0;                   // when we sent the trigger
-uint32_t usEchoStartUs = 0;                 // when echo pin went HIGH
-float lastDistanceM = NAN;                  // most recent valid reading
-constexpr uint32_t US_TIMEOUT_US = 15000UL; // same 15 ms max
-
-void ultrasonicUpdate()
-{
-  switch (usState)
-  {
-  case US_IDLE:
-    // Nothing to do — call ultrasonicStart() to begin a measurement
-    break;
-
-  case US_TRIGGER:
-    // We set TRIG high for 10 µs, then go low and move on
-    // (This part is so fast we can do it in one pass)
-    digitalWrite(TRIG_PIN, LOW);
-    delayMicroseconds(2);
-    digitalWrite(TRIG_PIN, HIGH);
-    delayMicroseconds(10);
-    digitalWrite(TRIG_PIN, LOW);
-    usTriggerUs = micros();
-    usState = US_WAIT_ECHO;
-    break;
-
-  case US_WAIT_ECHO:
-  {
-    uint32_t now_us = micros();
-    bool echoHigh = digitalRead(ECHO_PIN);
-
-    if (usEchoStartUs == 0)
-    {
-      // Waiting for echo to go HIGH (pulse start)
-      if (echoHigh)
-      {
-        usEchoStartUs = now_us;
-      }
-      else if (now_us - usTriggerUs > US_TIMEOUT_US)
-      {
-        // Echo never started — no object in range
-        lastDistanceM = NAN;
-        usState = US_IDLE;
-      }
-    }
-    else
-    {
-      // Echo is running — waiting for it to go LOW (pulse end)
-      if (!echoHigh)
-      {
-        uint32_t duration = now_us - usEchoStartUs;
-        lastDistanceM = duration * 0.0001715f;
-        usEchoStartUs = 0;
-        usState = US_IDLE;
-      }
-      else if (now_us - usEchoStartUs > US_TIMEOUT_US)
-      {
-        // Echo stuck HIGH — out of range
-        lastDistanceM = NAN;
-        usEchoStartUs = 0;
-        usState = US_IDLE;
-      }
-    }
-    break;
-  }
-  }
+  servo_yaw.write((int)lastYawPos);
+  servo_roll.write((int)lastRollPos);
+  servo_pitch.write((int)lastPitchPos);
 }
 
-// Call this to kick off a new measurement
-void ultrasonicStart()
-{
-  if (usState == US_IDLE)
-  {
-    usState = US_TRIGGER;
-    usEchoStartUs = 0;
-  }
-}
-
-// ======== MSP State Machine ========
-enum MspState : uint8_t
-{
-  MSP_IDLE,
-  MSP_SENT,
-  MSP_PARSE
-};
-
-MspState mspState = MSP_IDLE;
-uint32_t mspSentMs = 0;
-uint8_t mspBuf[MSP_REPLY_LEN]; // 12-byte reply buffer
-uint8_t mspBufIdx = 0;
-constexpr uint32_t MSP_TIMEOUT_MS = 50; // tighter than 100 ms
-
-void mspUpdate()
-{
-  switch (mspState)
-  {
-  case MSP_IDLE:
-    break;
-
-  case MSP_SENT:
-  {
-    // Collect bytes as they arrive — no waiting
-    while (droneSerial.available() && mspBufIdx < MSP_REPLY_LEN)
-    {
-      mspBuf[mspBufIdx++] = droneSerial.read();
-    }
-
-    if (mspBufIdx >= MSP_REPLY_LEN)
-    {
-      // All bytes received — move to parse
-      mspState = MSP_PARSE;
-    }
-    else if (millis() - mspSentMs > MSP_TIMEOUT_MS)
-    {
-      // Timeout — discard partial data
-      Serial.println(F("MSP timeout"));
-      mspState = MSP_IDLE;
-    }
-    break;
-  }
-
-  case MSP_PARSE:
-  {
-    // Validate header: $, M, >
-    if (mspBuf[0] != '$' || mspBuf[1] != 'M' || mspBuf[2] != '>')
-    {
-      Serial.println(F("MSP bad header"));
-      mspState = MSP_IDLE;
-      break;
-    }
-
-    // Bytes 3 = payload size, 4 = command
-    // Bytes 5..10 = roll(2), pitch(2), yaw(2)
-    // Byte 11 = checksum
-
-    mspRoll = (int16_t)((uint16_t)mspBuf[6] << 8 | mspBuf[5]);
-    mspPitch = (int16_t)((uint16_t)mspBuf[8] << 8 | mspBuf[7]);
-    mspYaw = (int16_t)((uint16_t)mspBuf[10] << 8 | mspBuf[9]);
-
-    // Optional: verify checksum
-    // XOR of bytes 3..10 should equal byte 11
-    uint8_t crc = 0;
-    for (uint8_t i = 3; i < 11; i++)
-      crc ^= mspBuf[i];
-
-    if (crc != mspBuf[11])
-    {
-      Serial.println(F("MSP CRC fail"));
-    }
-
-    mspState = MSP_IDLE;
-    break;
-  }
-  }
-}
-
-void mspStart()
-{
-  if (mspState != MSP_IDLE)
-    return;
-
-  // Flush stale data
-  while (droneSerial.available())
-    droneSerial.read();
-
-  // Send request
-  for (uint8_t i = 0; i < MSP_REQ_LEN; i++)
-    droneSerial.write(pgm_read_byte(&MSP_REQ_ATTITUDE[i]));
-
-  mspBufIdx = 0;
-  mspSentMs = millis();
-  mspState = MSP_SENT;
-}
-
-// ——————————————————————————————————————————
-// Setup
-// ——————————————————————————————————————————
+// Initialize hardware, sensors, filters, servos, and logging.
 void setup()
 {
-  // Open connection to Drone (Virtual Port)
-  // Note: SoftwareSerial at 115200 can be a bit unstable.
-  // If this fails, try lowering FC baud rate to 57600 in Cleanflight.
-  droneSerial.begin(115200);
 
-  // Assigning pins for ultrasound sensor
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
+  pinMode(MODE_PIN, INPUT);
 
   Wire.begin();
   Wire.setClock(400000UL); // Fast-mode I²C — MPU6050 supports it
 
   Serial.begin(115200);
-  Serial.println(F("Arduino Ready. Connecting to Drone..."));
+  Serial.println(F("Arduino Ready. Connecting to MPU..."));
 
   // ======== MPU Setup ========
   Serial.println(F("Init MPU"));
@@ -390,11 +379,15 @@ void setup()
   lastPitchPos = PITCH_CENTRE;
   lastRollPos = ROLL_CENTRE;
   lastYawPos = YAW_CENTRE;
+  lastFilterUpdateUs = micros();
 
   // Center servos on startup
   servo_pitch.write(PITCH_CENTRE);
   servo_roll.write(ROLL_CENTRE);
   servo_yaw.write(YAW_CENTRE);
+  lockedPitchPos = PITCH_CENTRE;
+  lockedRollPos = ROLL_CENTRE;
+  lockedYawPos = YAW_CENTRE;
   delay(1000);
 
   // ======== SD Card setup ========
@@ -408,7 +401,7 @@ void setup()
 
   if (sdReady && logFile.fileSize() == 0)
   {
-    logFile.println(F("t_ms,distance_m,ax_mps2,ay_mps2,az_mps2,gx_rps,gy_rps,gz_rps"));
+    logFile.println(F("t_ms,f_ax_mps2,f_ay_mps2,f_az_mps2,f_gx_rps,f_gy_rps,f_gz_rps"));
     logFile.flush();
   }
 
@@ -418,62 +411,72 @@ void setup()
   delay(1000);
 }
 
+// Main control loop that reads sensors, updates mode, drives servos, and logs data.
 void loop()
 {
   uint32_t now = millis();
   mpu.update();
-  angx = mpu.getAngleX();
-  angy = mpu.getAngleY();
-  angz = mpu.getAngleZ();
-  ax = mpu.getAccX() * G_MPS2;
-  ay = mpu.getAccY() * G_MPS2;
-  az = mpu.getAccZ() * G_MPS2;
-  gx = mpu.getGyroX();
-  gy = mpu.getGyroY();
-  gz = mpu.getGyroZ();
+  rawAngx = mpu.getAngleX();
+  rawAngy = mpu.getAngleY();
+  rawAngz = mpu.getAngleZ();
+  rawAx = mpu.getAccX() * G_MPS2;
+  rawAy = mpu.getAccY() * G_MPS2;
+  rawAz = mpu.getAccZ() * G_MPS2;
+  rawGx = mpu.getGyroX();
+  rawGy = mpu.getGyroY();
+  rawGz = mpu.getGyroZ();
 
   if (mpuSettling())
     return; // No data gathered until settled
 
-  filterAndActuate(); // Filters all MPU readings and writes to servos
+  handleModeTransition(readGimbalMode());
+
+  updateMpuFilters(micros());
+
+  if (gimbalMode == GimbalMode::Stabilising)
+  {
+    if (filtersJustReset)
+    {
+      filtersJustReset = false;
+    }
+    else
+    {
+      filterAndActuate(); // Filters all MPU readings and writes to servos
+    }
+  }
+  else
+  {
+    holdLockedPosition();
+  }
 
   // ---- Logging (rate-limited) ----
   if (now - lastLogMs >= LOG_PERIOD_MS)
   {
     lastLogMs += LOG_PERIOD_MS;
 
-    float d = lastDistanceM;
-
-    ultrasonicStart();
-
-    // Write to both Serial and SD without snprintf (saves ~128 bytes RAM + ~1.5 KB flash)
-    Print *out[2] = {&Serial, nullptr};
-    uint8_t outCount = 1;
+    // Write post-filter MPU outputs to SD without snprintf (saves ~128 bytes RAM + ~1.5 KB flash)
     if (sdReady)
     {
-      out[1] = &logFile;
-      outCount = 2;
-    }
-    for (uint8_t i = 0; i < outCount; i++)
-    {
-      out[i]->print(now);
-      out[i]->print(',');
-      if (isnan(d))
-        out[i]->print(F("NaN"));
-      else
-        out[i]->print(d, 4);
-      out[i]->print(',');
-      out[i]->print(ax, 3);
-      out[i]->print(',');
-      out[i]->print(ay, 3);
-      out[i]->print(',');
-      out[i]->print(az, 3);
-      out[i]->print(',');
-      out[i]->print(gx, 3);
-      out[i]->print(',');
-      out[i]->print(gy, 3);
-      out[i]->print(',');
-      out[i]->println(gz, 3);
+      const float filteredAx = ax;
+      const float filteredAy = ay;
+      const float filteredAz = az;
+      const float filteredGx = gx;
+      const float filteredGy = gy;
+      const float filteredGz = gz;
+
+      logFile.print(now);
+      logFile.print(',');
+      logFile.print(filteredAx, 3);
+      logFile.print(',');
+      logFile.print(filteredAy, 3);
+      logFile.print(',');
+      logFile.print(filteredAz, 3);
+      logFile.print(',');
+      logFile.print(filteredGx, 3);
+      logFile.print(',');
+      logFile.print(filteredGy, 3);
+      logFile.print(',');
+      logFile.println(filteredGz, 3);
     }
   }
 
@@ -482,20 +485,11 @@ void loop()
     lastFlushMs = now;
     logFile.flush();
   }
-  ultrasonicUpdate();
-
-  // ---- MSP from FC (rate-limited) ----
-  if (now - lastMspMs >= MSP_PERIOD_MS)
-  {
-    lastMspMs += MSP_PERIOD_MS; // use += to prevent drift
-    mspStart();
-  }
-  mspUpdate();
 
   // ---- Teleplot (rate-limited to avoid flooding serial) ----
-  // Only output teleplot every ~100 ms (10 Hz) instead of every loop
+  // Outputs every 5 ms (~200 Hz)
   static uint32_t lastTeleMs = 0;
-  if (now - lastTeleMs >= 100)
+  if (now - lastTeleMs >= 5)
   {
     lastTeleMs = now;
     Serial.print(F(">Pitch:"));

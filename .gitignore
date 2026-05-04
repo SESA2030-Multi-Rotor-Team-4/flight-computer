@@ -10,3 +10,5 @@ lib/README
 test/README
 include/README
 .vscode/extensions.json
+src/flight-computer.code-workspace
+.DS_Store
