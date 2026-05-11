@@ -22,7 +22,7 @@ constexpr uint8_t YAW_PIN = 9;
 
 // IMU state and raw sensor values.
 MPU6050 mpu(Wire);
-constexpr float G_MPS2 = 9.81f; // gravity if we need it
+constexpr float G_MPS2 = 9.81f;
 
 float rawAx, rawAy, rawAz;
 float rawGx, rawGy, rawGz;
